@@ -34,7 +34,7 @@ optimal_values = {
 }
 
 # 优化算法列表
-optimizers = ["L-SHADE", "L-SHADE-cnEpsin", "APSM-jSO", "iL-SHADE-RSP", "APDSDE"]
+optimizers = ["ACD-DE"]
 
 # 测试函数列表 (15-30)
 test_functions = list(range(1, 31))
@@ -71,6 +71,8 @@ def get_optimizer(optimizer_name, objective, tol):
         return APSM_jSO(objective, bounds, pop_size, max_iter, H=5, tol=tol)
     elif optimizer_name == "APDSDE":
         return APDSDE(objective, bounds, pop_size, max_iter, H=6, tol=tol)
+    elif optimizer_name == "ACD-DE":
+        return ACD_DE(objective, bounds, pop_size, max_iter, H=6, tol=tol)
     else:
         raise ValueError(f"Unknown optimizer {optimizer_name}")
 

@@ -11,6 +11,7 @@ from APSM_jSO_py import APSM_jSO
 from iLSHADE_RSP_py import iLSHADE_RSP
 from ACD_DE_py import ACD_DE
 from APDSDE_py import APDSDE
+from mLSHADE_SPACMA_py import mLSHADE_SPACMA
 import cec2017.functions as functions
 
 def cec2017_f1(x):
@@ -43,6 +44,8 @@ def run_optimizer(optimizer_name):
         result = ACD_DE(objective, bounds, pop_size, max_iter, H=6, tol=None)
     elif optimizer_name == "APDSDE":
         result = APDSDE(objective, bounds, pop_size, max_iter, H=6, tol=None)
+    elif optimizer_name == "mL-SHADE-SPACMA":
+        result = mLSHADE_SPACMA(objective, bounds, pop_size, max_iter, H=5, tol=None)
     else:
         raise ValueError(f"Unknown optimizer {optimizer_name}")
 
@@ -54,7 +57,7 @@ def run_optimizer(optimizer_name):
 # 并行执行部分
 if __name__ == "__main__":
     # optimizers = ["L-SHADE", "L-SHADE-cnEpsin", "jSO", "L-SHADE-RSP", "APSM-jSO"]
-    optimizers = ["iL-SHADE-RSP"]
+    optimizers = ["mL-SHADE-SPACMA"]
 
     num_workers = min(len(optimizers), cpu_count())
 

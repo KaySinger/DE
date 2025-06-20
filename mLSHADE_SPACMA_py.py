@@ -1,14 +1,10 @@
-from collections import deque
-
 import numpy as np
 from scipy.stats import norm, cauchy
+import collections
+
 
 class mLSHADE_SPACMA:
-    def __init__(self, func, bounds, pop_size=None, max_evals=None, H=6, tol=None):
-        """
-        L-SHADE优化算法类
-        后续改进的基础算法
-        """
+    def __init__(self, func, bounds, pop_size=None, max_evals=None, H=5, tol=None):
         self.func = func
         self.bounds = np.array(bounds)
         self.dim = len(bounds)
@@ -17,157 +13,163 @@ class mLSHADE_SPACMA:
         self.max_evals = 10000 * self.dim if max_evals is None else max_evals
         self.H = H
         self.tol = tol
-        self.num_evals = self.N_init
-        self.gen = 0
-        self.rho = 0.11
+        self.num_evals = 0
+        self.gen = 1
+        self.rho = 0.11  # 淘汰比例
+        self.k = 3  # RSP控制参数
 
-        # 初始化历史记忆
+        # 历史记忆初始化
         self.F_memory = np.ones(self.H) * 0.5
         self.CR_memory = np.ones(self.H) * 0.5
         self.hist_idx = 0
 
         # 混合算法参数
-        self.FCP_memory = [0.5] * H  # First Class Probability (LSHADE分配概率)
+        self.FCP_memory = np.ones(self.H) * 0.5  # LSHADE分配概率
         self.c = 0.8  # 学习率
+        self.L_rate = 0.8  # 混合参数学习率
 
-        # 初始化种群和存档
-        self.N_current = self.N_init  # 当前种群大小
+        # 初始化种群
+        self.N_current = self.N_init
         self.pop = np.random.uniform(
             low=self.bounds[:, 0],
             high=self.bounds[:, 1],
             size=(self.N_init, self.dim)
         )
         self.fitness = np.apply_along_axis(self.func, 1, self.pop)
-        self.archive = deque(maxlen=int(1.4 * self.N_current))  # FIFO存档（最大长度1.4*NP）
+        self.num_evals += self.N_init
         self.iteration_log = []
 
-        # CMA-ES参数初始化
-        self.sigma = 0.5
-        self.xmean = np.mean(self.pop, axis=0)
+        # 存档初始化 (修改为列表存储)
+        self.archive = []  # 格式: (solution, fitness)
+        self.archive_max_size = int(1.4 * self.N_current)
+
+        # 找出初始最优解
+        best_idx = np.argmin(self.fitness)
+        self.best_fitness = self.fitness[best_idx]
+        self.best_solution = self.pop[best_idx].copy()
+        self.iteration_log.append(self.best_fitness)
+
+        # CMA-ES参数初始化 (修改为加权平均)
+        sorted_indices = np.argsort(self.fitness)
         self.mu = self.N_current // 2
         self.weights = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
         self.weights /= np.sum(self.weights)
-        self.mueff = 1 / np.sum(self.weights ** 2)
+        self.xmean = np.dot(self.weights, self.pop[sorted_indices[:self.mu]])
 
         # 协方差矩阵参数
+        self.sigma = 0.5
+        self.mueff = 1 / np.sum(self.weights ** 2)
         self.cc = (4 + self.mueff / self.dim) / (self.dim + 4 + 2 * self.mueff / self.dim)
         self.cs = (self.mueff + 2) / (self.dim + self.mueff + 5)
         self.c1 = 2 / ((self.dim + 1.3) ** 2 + self.mueff)
         self.cmu = min(1 - self.c1, 2 * (self.mueff - 2 + 1 / self.mueff) / ((self.dim + 2) ** 2 + self.mueff))
         self.damps = 1 + 2 * max(0, np.sqrt((self.mueff - 1) / (self.dim + 1)) - 1) + self.cs
-
-        # 协方差矩阵
+        self.pc = np.zeros(self.dim)
+        self.ps = np.zeros(self.dim)
         self.B = np.eye(self.dim)
         self.D = np.ones(self.dim)
         self.C = self.B @ np.diag(self.D ** 2) @ self.B.T
         self.invsqrtC = np.eye(self.dim)
-        self.pc = np.zeros(self.dim)
-        self.ps = np.zeros(self.dim)
         self.eigeneval = 0
         self.chiN = self.dim ** 0.5 * (1 - 1 / (4 * self.dim) + 1 / (21 * self.dim ** 2))
 
-    # 线性种群缩减策略
+        # 计算最大迭代次数
+        self.max_gen = 0
+        i = 0
+        while i < self.max_evals:
+            self.max_gen += 1
+            n = int(round(self.N_init - (self.N_init - self.N_min) * i / self.max_evals))
+            i += n
+
     def _linear_pop_size_reduction(self):
+        return max(self.N_min, int(round(
+            self.N_init - (self.N_init - self.N_min) * self.num_evals / self.max_evals
+        )))
 
-        return max(self.N_min, int(round(self.N_init - (self.N_init - self.N_min) * self.num_evals / self.max_evals)))
+    def bound_constraint(self, vi, parent):
+        """边界处理，使用反射策略 (与作者Matlab代码一致)"""
+        for d in range(self.dim):
+            low, high = self.bounds[d]
+            if vi[d] < low:
+                vi[d] = (parent[d] + low) / 2
+            elif vi[d] > high:
+                vi[d] = (parent[d] + high) / 2
+        return vi
 
-    # 边界处理
-    def handle_boundary(self, individual, parent):
-        low = self.bounds[:, 0]
-        high = self.bounds[:, 1]
+    def generate_mutant(self, i, F, FCP):
+        """生成变异个体 (整合RSP和CMA-ES)"""
+        if np.random.rand() < FCP:  # LSHADE变异
+            # 计算排名概率 (修正RSP实现)
+            sorted_indices = np.argsort(self.fitness)
+            ranks = self.k * (self.N_current - np.arange(self.N_current)) + 1
+            prs = ranks / np.sum(ranks)
 
-        # 当个别超界时修正
-        individual = np.where(individual < low, (low + parent) / 2, individual)
-        individual = np.where(individual > high, (high + parent) / 2, individual)
-
-        return individual
-
-    def mutant(self, i, F, FCP):
-        """生成变异个体（包含CMA-ES混合逻辑）"""
-        if np.random.rand() < FCP:
-            # 采用LSHADE变异策略
+            # 选择pbest (前p%)
             p_i = 0.11
             p_best_size = max(2, int(self.N_current * p_i))
-            sorted_indices = np.argsort(self.fitness)
-
-            p_best_indices = sorted_indices[:p_best_size]
-            p_best_idx = np.random.choice(p_best_indices)
+            p_best_idx = sorted_indices[np.random.randint(0, p_best_size)]
             p_best = self.pop[p_best_idx]
 
-            # 计算排名及概率
-            ranks = 3 * (self.N_current - np.arange(1, self.N_current + 1)) + 1
-            # 计算概率
-            prs = np.zeros(self.N_current)
-            prs[sorted_indices] = ranks
-            prs /= prs.sum()
+            # 基于排名概率选择r1
+            r1_idx = np.random.choice(self.N_current, p=prs)
+            r1 = self.pop[sorted_indices[r1_idx]]
 
-            # r1基于RSP概率
-            candidates_r1 = np.setdiff1d(np.arange(self.N_current), [i, p_best_idx])
-            prs_r1 = prs[candidates_r1]
-            prs_r1 /= prs_r1.sum()
-            r1_idx = np.random.choice(candidates_r1, p=prs_r1)
-            r1 = self.pop[r1_idx]
-
-            # r2从A∪P抽取
+            # 从种群或存档中选择r2
             if len(self.archive) > 0:
-                combined = np.vstack([self.pop, np.array(self.archive)])
+                archive_solutions = np.array([item[0] for item in self.archive])
+                combined = np.vstack([self.pop, archive_solutions])
             else:
                 combined = self.pop
-            r2_idx = np.random.randint(0, combined.shape[0])
+            r2_idx = np.random.randint(0, len(combined))
             r2 = combined[r2_idx]
 
             mutant = self.pop[i] + F * (p_best - self.pop[i]) + F * (r1 - r2)
-            FCP_judge = 1
-        else:
-            # CMA-ES变异策略
+            strategy_type = 1  # LSHADE
+        else:  # CMA-ES变异
             z = self.B @ (self.D * np.random.randn(self.dim))
             mutant = self.xmean + self.sigma * z
-            FCP_judge = 2
+            strategy_type = 2  # CMA-ES
 
-        mutant = self.handle_boundary(mutant, self.pop[i])
-        return mutant, FCP_judge
-    def cross(self, mutant, i, CR):
-        cross_chorm = self.pop[i].copy()
-        j = np.random.randint(0, self.dim)  # 随机选择一个维度
-        for k in range(self.dim):  # 对每个维度进行交叉
-            if np.random.rand() < CR or k == j:  # 如果随机数小于交叉率或者维度为j
-                cross_chorm[k] = mutant[k]  # 交叉
-        return cross_chorm
+        mutant = self.bound_constraint(mutant, self.pop[i])
+        return mutant, strategy_type
+
+    def crossover(self, mutant, target, CR):
+        """二项交叉"""
+        trial = np.copy(target)
+        j_rand = np.random.randint(0, self.dim)
+        for j in range(self.dim):
+            if np.random.rand() < CR or j == j_rand:
+                trial[j] = mutant[j]
+        return trial
+
+    def update_archive(self, solution, fitness):
+        """更新存档 (精英保留策略)"""
+        self.archive.append((solution.copy(), fitness))
+
+        # 如果存档超过大小，删除最差个体
+        if len(self.archive) > self.archive_max_size:
+            # 按适应度排序 (最小最优)
+            self.archive.sort(key=lambda x: x[1])
+            # 保留最好的个体
+            self.archive = self.archive[:self.archive_max_size]
 
     def optimize(self):
-        i = 0
-        max_gen = 0
-        # 计算最大迭代次数
-        while i < self.max_evals:
-            max_gen += 1
-            n = int(round(self.N_init - (self.N_init - self.N_min) * i / self.max_evals))
-            i += n
-        print(max_gen)
-
+        print(self.max_gen)
         """执行优化过程"""
         while self.num_evals < self.max_evals:
-            S_F, S_CR, S_weights = [], [], []
-            S_FCP = []
-            delta_alg1, delta_alg2 = [], []
-            new_pop = []
-            new_fitness = []
+            # 记录当前最优
+            self.iteration_log.append(self.best_fitness)
 
-            # 记录当前最优值
-            best_val = np.min(self.fitness)
-            self.iteration_log.append(best_val)
             # 收敛检查
-            if self.tol is not None and best_val <= self.tol:
-                print(f"Converged at generation {self.gen + 1}: {best_val}")
+            if self.tol is not None and self.best_fitness <= self.tol:
                 break
-            elif self.num_evals > self.max_evals:
-                print(f"Converged at generation {self.gen + 1}: {best_val}")
+            if self.num_evals >= self.max_evals:
                 break
 
-            if self.gen < max_gen // 2:
-                # 淘汰机制
+            # 精确淘汰与生成机制 (仅在前半段)
+            if self.num_evals < self.max_evals / 2:
                 PE_m = int(np.ceil(self.rho * self.N_current))
                 sorted_indices = np.argsort(self.fitness)
-                eliminated_indices = sorted_indices[-PE_m:]
 
                 # 生成新个体
                 best1 = self.pop[sorted_indices[0]]
@@ -175,150 +177,182 @@ class mLSHADE_SPACMA:
                 new_individuals = []
 
                 for _ in range(PE_m):
-                    # 生成新个体
                     new_ind = best1 + np.random.rand() * (best1 - best2)
-
-                    # 边界处理 - 确保新个体在搜索空间内
-                    for d in range(self.dim):
-                        if new_ind[d] > self.bounds[:, 1][d]:
-                            new_ind[d] = 2 * self.bounds[:, 1][d] - new_ind[d]
-                        elif new_ind[d] < self.bounds[:, 0][d]:
-                            new_ind[d] = 2 * self.bounds[:, 0][d] - new_ind[d]
-
+                    new_ind = self.bound_constraint(new_ind, best1)
                     new_individuals.append(new_ind)
 
+                # 替换最差个体
+                self.pop[sorted_indices[-PE_m:]] = new_individuals
+                self.fitness[-PE_m:] = np.apply_along_axis(self.func, 1, new_individuals)
+                self.num_evals += PE_m
+
+                # 更新最优解
+                current_best_idx = np.argmin(self.fitness)
+                if self.fitness[current_best_idx] < self.best_fitness:
+                    self.best_fitness = self.fitness[current_best_idx]
+                    self.best_solution = self.pop[current_best_idx].copy()
+
+            # 初始化成功参数记录
+            S_F, S_CR, S_weights = [], [], []
+            delta_alg1, delta_alg2 = [], []
+            new_pop = []
+            new_fitness = []
+
+            # 为每个个体生成参数
+            mem_rand_index = np.random.randint(0, self.H, self.N_current)
+            mu_sf = self.F_memory[mem_rand_index]
+            mu_cr = self.CR_memory[mem_rand_index]
+            FCP_rand = self.FCP_memory[mem_rand_index]
+
+            # 生成CR和F
+            cr = np.clip(np.random.normal(mu_cr, 0.1), 0, 1)
+            term_pos = mu_cr == -1
+            cr[term_pos] = 0
+
+            if self.num_evals < self.max_evals / 2:
+                sf = 0.5 + 0.1 * np.random.rand(self.N_current)
+            else:
+                sf = mu_sf + 0.1 * np.tan(np.pi * (np.random.rand(self.N_current) - 0.5))
+                sf = np.clip(sf, 0, 1)
+
+            # 主循环处理每个个体
             for i in range(self.N_current):
-                # 参数生成阶段
-                r = np.random.randint(0, self.H)
-
-                CR = np.clip(np.random.normal(self.CR_memory[r], 0.1), 0, 1)
-
-                # SPA机制：前半段固定F范围，后半段自适应
-                if self.num_evals < self.max_evals / 2:
-                    F = 0.5 + 0.1 * np.random.rand()
-                else:
-                    F = cauchy.rvs(loc=self.F_memory[r], scale=0.1)
-                    while F > 1 or F < 0:
-                        if F < 0:
-                            F = cauchy.rvs(loc=self.F_memory[r], scale=0.1)
-                        else:
-                            F = 1
-
-                FCP = self.FCP_memory[r]
-
                 # 生成变异个体
-                mutant, FCP_judge = self.mutant(i, F, FCP)
-                trial = self.cross(mutant, self.pop[i], CR)
+                mutant, strategy_type = self.generate_mutant(i, sf[i], FCP_rand[i])
 
+                # 交叉
+                trial = self.crossover(mutant, self.pop[i], cr[i])
+
+                # 评估
                 trial_fitness = self.func(trial)
+
+                # 更新全局最优
+                if trial_fitness < self.best_fitness:
+                    self.best_fitness = trial_fitness
+                    self.best_solution = trial.copy()
 
                 # 贪心选择
                 if trial_fitness < self.fitness[i]:
                     new_pop.append(trial)
                     new_fitness.append(trial_fitness)
-                    # 记录成功参数和适应度改进量
-                    S_F.append(F)
-                    S_CR.append(CR)
-                    S_FCP.append(FCP)
-                    S_weights.append(np.abs(self.fitness[i] - trial_fitness))
+
+                    # 记录成功参数
+                    S_F.append(sf[i])
+                    S_CR.append(cr[i])
+                    S_weights.append(self.fitness[i] - trial_fitness)  # 改进量
+
                     # 更新存档
-                    self.archive.append(self.pop[i].copy())
-                    if FCP_judge == 1:
+                    self.update_archive(self.pop[i], self.fitness[i])
+
+                    # 记录策略改进量
+                    if strategy_type == 1:
                         delta_alg1.append(self.fitness[i] - trial_fitness)
                     else:
                         delta_alg2.append(self.fitness[i] - trial_fitness)
                 else:
                     new_pop.append(self.pop[i])
                     new_fitness.append(self.fitness[i])
+
+            # 更新种群
             self.num_evals += self.N_current
-            self.gen += 1
+            self.pop = np.array(new_pop)
+            self.fitness = np.array(new_fitness)
 
-            # --- LPSR关键步骤 ---
-            # 更新种群大小
+            # 更新历史记忆
+            if S_F:
+                total_improvement = sum(S_weights)
+                if total_improvement > 0:
+                    # 归一化权重
+                    norm_weights = [w / total_improvement for w in S_weights]
+
+                    # 更新F记忆 (加权Lehmer均值)
+                    F_lehmer = sum(f ** 2 * w for f, w in zip(S_F, norm_weights)) / sum(
+                        f * w for f, w in zip(S_F, norm_weights))
+                    self.F_memory[self.hist_idx] = F_lehmer
+
+                    # 更新CR记忆
+                    if max(S_CR) == 0 or self.CR_memory[self.hist_idx] == -1:
+                        self.CR_memory[self.hist_idx] = -1
+                    else:
+                        CR_lehmer = sum(c ** 2 * w for c, w in zip(S_CR, norm_weights)) / sum(
+                            c * w for c, w in zip(S_CR, norm_weights))
+                        self.CR_memory[self.hist_idx] = CR_lehmer
+
+                    # 更新FCP记忆
+                    if delta_alg1 and delta_alg2:
+                        ratio = sum(delta_alg1) / (sum(delta_alg1) + sum(delta_alg2))
+                        self.FCP_memory[self.hist_idx] = self.L_rate * self.FCP_memory[self.hist_idx] + (
+                                    1 - self.L_rate) * ratio
+                        self.FCP_memory[self.hist_idx] = np.clip(self.FCP_memory[self.hist_idx], 0.2, 0.8)
+
+                # 移动历史指针
+                self.hist_idx = (self.hist_idx + 1) % self.H
+
+            # 种群缩减
             new_N = self._linear_pop_size_reduction()
-            # 选择适应度最好的个体保留
-            combined_fitness = np.array(new_fitness)
-            survivor_indices = np.argsort(combined_fitness)[:new_N]
-            # 更新种群和适应度
-            self.pop = np.array([new_pop[i] for i in survivor_indices])
-            self.fitness = np.array([new_fitness[i] for i in survivor_indices])
-            self.N_current = new_N
+            if self.N_current > new_N:
+                reduction_num = self.N_current - new_N
+                sorted_indices = np.argsort(self.fitness)
 
-            self.mu = max(1, self.N_current // 2)  # 防止mu为0
-            self.weights = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
-            self.weights /= np.sum(self.weights)  # 归一化权重
-            self.mueff = 1 / np.sum(self.weights ** 2)  # 更新有效种群大小
+                # 删除最差个体
+                self.pop = np.delete(self.pop, sorted_indices[-reduction_num:], axis=0)
+                self.fitness = np.delete(self.fitness, sorted_indices[-reduction_num:])
+                self.N_current = new_N
 
-            # 更新CMA-ES参数
-            popold = np.copy(self.pop)  # CMA-ES部分用的旧种群
+                # 更新存档大小
+                if len(self.archive) > self.archive_max_size:
+                    self.archive.sort(key=lambda x: x[1])
+                    self.archive = self.archive[:self.archive_max_size]
 
-            # 按适应度排序
-            popindex = np.argsort(self.fitness)
-            if np.any(delta_alg2):
+                # 更新CMA-ES参数
+                self.mu = max(1, self.N_current // 2)
+                self.weights = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
+                self.weights /= np.sum(self.weights)
+                self.mueff = 1 / np.sum(self.weights ** 2)
+
+            # CMA-ES参数更新
+            if self.num_evals > self.max_evals / 2:  # 仅在后半段更新
+                sorted_indices = np.argsort(self.fitness)
                 xold = self.xmean.copy()
-                self.xmean = np.dot(popold[popindex[:self.mu]].T, self.weights)
 
-                # 演化路径ps更新
+                # 使用精英加权平均
+                self.xmean = np.dot(self.weights, self.pop[sorted_indices[:self.mu]])
+
+                # 演化路径更新
                 y = (self.xmean - xold) / self.sigma
-                self.ps = (1 - self.cs) * self.ps + np.sqrt(self.cs * (2 - self.cs) * self.mueff) * np.dot(
-                    self.invsqrtC, y)
+                self.ps = (1 - self.cs) * self.ps + np.sqrt(self.cs * (2 - self.cs) * self.mueff) * self.invsqrtC @ y
 
                 # hsig判别
                 ps_norm_sq = np.sum(self.ps ** 2)
-                hsig_cond = (1 - (1 - self.cs) ** (2 * (self.num_evals + 1) / self.N_current))
+                hsig_cond = (1 - (1 - self.cs) ** (2 * self.num_evals / self.N_current))
                 hsig = ps_norm_sq / (self.dim * hsig_cond) < (2 + 4 / (self.dim + 1))
 
                 # 演化路径pc更新
                 self.pc = (1 - self.cc) * self.pc + hsig * np.sqrt(self.cc * (2 - self.cc) * self.mueff) * y
 
-                # 协方差矩阵C更新
-                artmp = (popold[popindex[:self.mu]] - xold) / self.sigma  # mu个差分向量
+                # 协方差矩阵更新
+                artmp = (self.pop[sorted_indices[:self.mu]] - xold) / self.sigma
                 self.C = (1 - self.c1 - self.cmu) * self.C + self.c1 * (
-                            np.outer(self.pc, self.pc) + (1 - hsig) * self.cc * (
-                                2 - self.cc) * self.C) + self.cmu * np.dot((artmp.T * self.weights), artmp)
+                        np.outer(self.pc, self.pc) + (1 - hsig) * self.cc * (2 - self.cc) * self.C
+                ) + self.cmu * artmp.T @ np.diag(self.weights) @ artmp
 
-                # 步长sigma更新
+                # 步长更新
                 self.sigma *= np.exp((self.cs / self.damps) * (np.linalg.norm(self.ps) / self.chiN - 1))
 
-                # C矩阵特征分解更新，O(d^2)复杂度
-                if self.num_evals - self.eigeneval >= np.ceil(self.N_current / (self.c1 + self.cmu) / self.dim / 10):
-                    self.eigeneval = (self.num_evals + 1)
-                    self.C = np.triu(self.C) + np.triu(self.C, 1).T  # 保证对称性
-                    if np.any(np.isnan(self.C)) or np.any(~np.isfinite(self.C)) or not np.isrealobj(self.C):
-                        print("C matrix invalid, skipping CMA update")
-                        continue  # 出问题跳过CMA-ES更新
+                # 定期更新特征分解
+                if self.num_evals - self.eigeneval > self.N_current / (self.c1 + self.cmu) / self.dim / 10:
+                    self.eigeneval = self.num_evals
+                    self.C = (self.C + self.C.T) / 2  # 确保对称
                     D2, B = np.linalg.eigh(self.C)
-                    if np.any(D2 < 0):
-                        D2[D2 < 0] = 1e-10  # 数值安全
+                    D2 = np.maximum(D2, 1e-10)  # 防止负值
                     self.D = np.sqrt(D2)
                     self.B = B
-                    self.invsqrtC = np.dot(self.B, np.dot(np.diag(self.D ** -1), self.B.T))
+                    self.invsqrtC = B @ np.diag(1 / self.D) @ B.T
 
-            # 更新历史记忆（加权Lehmer均值）
-            if np.any(S_F):
-                F_lehmer = np.sum(np.array(S_F) ** 2 * S_weights) / np.sum(np.array(S_F) * S_weights)
-                self.F_memory[self.hist_idx] = F_lehmer
+            # 进度输出
+            # if self.gen % 100 == 0:
+            print(f"Gen {self.gen}, Pop: {self.N_current}, Best: {self.best_fitness:.6e}, Evals: {self.num_evals}/{self.max_evals}")
 
-            # CR 部分
-            if np.any(S_CR):
-                if np.max(S_CR) == 0 or self.CR_memory[self.hist_idx] == np.nan:
-                    self.CR_memory[self.hist_idx] = np.nan  # 置为 ⊥，表示未来采样的 CR 必为 0
-                else:
-                    CR_lehmer = np.sum(np.array(S_CR) ** 2 * S_weights) / np.sum(np.array(S_CR) * S_weights)
-                    self.CR_memory[self.hist_idx] = CR_lehmer
+            self.gen += 1
 
-            if np.any(S_FCP):
-                # 更新混合概率
-                total_improve = np.sum(delta_alg1) + np.sum(delta_alg2)
-                ratio = np.sum(delta_alg1) / total_improve
-                # 平滑更新公式
-                self.FCP_memory[self.hist_idx] = np.clip(self.c * self.FCP_memory[self.hist_idx] + (1 - self.c) * ratio, 0.2, 0.8)
-
-            # 移动历史指针
-            self.hist_idx = (self.hist_idx + 1) % self.H
-
-            if self.gen % 100 == 0 or self.gen > max_gen:
-                print(f"Iteration {self.gen}, Pop Size: {self.N_current}, Best: {np.min(self.fitness)}, Num_Evals: {self.num_evals}")
-
-        best_idx = np.argmin(self.fitness)
-        return self.pop[best_idx], self.fitness[best_idx], self.iteration_log
+        return self.best_solution, self.best_fitness, self.iteration_log
